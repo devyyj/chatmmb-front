@@ -43,3 +43,5 @@ createRoot(document.getElementById('root')).render(
     </ThemeProvider>
   </StrictMode>,
 )
+
+// 자동 배포 테스트
