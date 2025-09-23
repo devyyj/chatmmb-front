@@ -30,7 +30,7 @@ jobs:
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           source: "dist/*"
-          target: "/home/ec2-user/dist"
+          target: "/home/ec2-user/dist/"
 
       - name: Restart docker-compose on EC2
         uses: appleboy/ssh-action@v1.0.3
