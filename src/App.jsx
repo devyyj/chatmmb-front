@@ -1,28 +1,71 @@
-// src/App.jsx
-// 요구사항: MUI, 반응형 로고 헤더(좌: 로고 / 중앙: 텍스트 / 우: QR), 접속 시 자동 참여, 단일 채팅방, 인증 없음
-// - 환경 분기: .env.* 의 VITE_API_BASE (없으면 상대경로)
-// - STOMP: onConnect 이후 publish, 자동 재연결(reconnectDelay)
-// - 탭(창)별 사용자 식별: sessionStorage에 userId(UUID), nickname 저장
-// - 메시지 표시: 내 메시지(본문만, 우측) / 상대 메시지("<sender>: 본문", 좌측)
+// App.jsx
+// React 18+, @mui/material, @stomp/stompjs, sockjs-client, react-virtuoso
 
-import React, {useEffect, useRef, useState} from 'react';
-import {Client} from '@stomp/stompjs';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Client } from '@stomp/stompjs';
 import SockJS from 'sockjs-client/dist/sockjs.min.js';
-import {Box, Button, List, Paper, TextField, Typography, useMediaQuery, useTheme,} from '@mui/material';
+import {
+  Box,
+  Button,
+  Paper,
+  TextField,
+  Typography,
+  useMediaQuery,
+  useTheme,
+} from '@mui/material';
+import { Virtuoso } from 'react-virtuoso';
+
+// -------------------------------
+// 입력창: 리스트 리렌더 영향 제거 + 전송 후 포커스 복귀
+// -------------------------------
+const InputBar = React.memo(function InputBar({
+                                                value,
+                                                onChange,
+                                                onEnter,
+                                                onSend,
+                                                inputRef,
+                                              }) {
+  // IME 조합 중 Enter 무시
+  const handleKeyDown = useCallback(
+    (e) => {
+      if (e.isComposing) return;
+      if (e.key === 'Enter') onEnter();
+    },
+    [onEnter]
+  );
+
+  return (
+    <Box display="flex" p={2} borderTop="1px solid #ddd" gap={1}>
+      <TextField
+        fullWidth
+        variant="outlined"
+        size="small"
+        placeholder="메시지를 입력하세요..."
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={handleKeyDown}
+        inputRef={inputRef}
+      />
+      <Button variant="contained" onClick={onSend} disabled={!value.trim()}>
+        전송
+      </Button>
+    </Box>
+  );
+});
 
 function App() {
   // 메시지 리스트
   const [messages, setMessages] = useState([]);
   // STOMP 클라이언트
-  const [client, setClient] = useState(null);
+  const clientRef = useRef(null);
   // 입력값
   const [input, setInput] = useState('');
+  // 입력창 포커스용 ref
+  const inputRef = useRef(null);
+
   // 내 사용자 식별 정보 (탭/창 단위)
   const myUserIdRef = useRef(null);
   const myNicknameRef = useRef(null);
-
-  // 스크롤 끝으로 이동 참조
-  const messagesEndRef = useRef(null);
 
   // 반응형 로고/QR 크기
   const theme = useTheme();
@@ -30,19 +73,29 @@ function App() {
   const upSm = useMediaQuery(theme.breakpoints.up('sm'));
   const logoHeight = upMd ? 64 : upSm ? 48 : 36; // md↑:64px, sm↑:48px, xs:36px
 
+  // 시간 포맷터(로컬 타임존, HH:mm:ss)
+  const timeFormatter = useMemo(
+    () =>
+      new Intl.DateTimeFormat(undefined, {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }),
+    []
+  );
+
   // 탭별 userId/nickname 초기화
   useEffect(() => {
-    // 이미 존재하면 재사용
     let uid = sessionStorage.getItem('userId');
     let nick = sessionStorage.getItem('nickname');
 
-    // 없으면 생성
     if (!uid) {
-      uid = globalThis.crypto?.randomUUID?.() || `uid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      uid =
+        globalThis.crypto?.randomUUID?.() ||
+        `uid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       sessionStorage.setItem('userId', uid);
     }
     if (!nick) {
-      // 간단한 닉네임 생성 (예: user-3f9a)
       const suffix = uid.split('-')[0].slice(-4);
       nick = `user-${suffix}`;
       sessionStorage.setItem('nickname', nick);
@@ -54,71 +107,162 @@ function App() {
 
   // STOMP 연결
   useEffect(() => {
-    const base = import.meta.env.VITE_API_BASE || '';
+    const base = import.meta.env?.VITE_API_BASE || '';
     const wsUrl = `${base}/ws-sockjs`;
 
     const socket = new SockJS(wsUrl);
     const stompClient = new Client({
       webSocketFactory: () => socket,
-      reconnectDelay: 5000, // 재연결(ms)
-      // debug 제거(요청사항: 디버그 로그 제외)
+      reconnectDelay: 5000, // 자동 재연결
+      // debug: console.log,
     });
 
-    // 연결 성공 시 구독
     stompClient.onConnect = () => {
+      // 단일 방 구독
       stompClient.subscribe('/topic/public', (msg) => {
         try {
           const body = JSON.parse(msg.body);
-          setMessages((prev) => [...prev, body]);
+          // createdAt > clientSentAt 기준 정렬
+          setMessages((prev) => {
+            const next = [...prev, body];
+            next.sort((a, b) => {
+              const ta = Date.parse(a?.createdAt ?? a?.clientSentAt ?? 0);
+              const tb = Date.parse(b?.createdAt ?? b?.clientSentAt ?? 0);
+              return ta - tb;
+            });
+            return next;
+          });
         } catch {
-          // JSON 파싱 실패 시 무시
+          // ignore
         }
       });
+
+      // 선택: 서버가 /app/chat.join 처리 시 입장 브로드캐스트
+      try {
+        const joinPayload = {
+          userId: myUserIdRef.current,
+          sender: myNicknameRef.current,
+          content: '',
+        };
+        stompClient.publish({
+          destination: '/app/chat.join',
+          body: JSON.stringify(joinPayload),
+        });
+      } catch {
+        // 서버 엔드포인트 없으면 무시
+      }
     };
 
     stompClient.activate();
-    setClient(stompClient);
+    clientRef.current = stompClient;
 
-    // 언마운트 시 연결 해제
     return () => {
       stompClient.deactivate();
+      clientRef.current = null;
     };
   }, []);
 
-  // 메시지 전송
-  const sendMessage = () => {
-    if (!client || !client.connected) return; // onConnect 이후에만 전송
-    const text = input.trim();
-    if (!text) return;
+  // 내 메시지 판정: userId 매칭 우선, 없으면 sender 매칭 보조
+  const isMine = useCallback(
+    (m) =>
+      (m?.userId && m.userId === myUserIdRef.current) ||
+      (m?.sender && m.sender === myNicknameRef.current),
+    []
+  );
 
+  // 메시지 전송
+  const sendMessage = useCallback(() => {
+    const client = clientRef.current;
+    if (!client || !client.connected) return;
+
+    const text = input.trim();
+    if (!text) {
+      // 포커스 유지
+      if (inputRef.current) inputRef.current.focus();
+      return;
+    }
+
+    // 클라이언트 낙관적 타임스탬프(서버 createdAt 도착 전까지 표시 대체)
     const payload = {
-      userId: myUserIdRef.current, // 탭 고유 식별자
-      sender: myNicknameRef.current, // 표시용 닉네임
+      userId: myUserIdRef.current,
+      sender: myNicknameRef.current,
       content: text,
+      clientSentAt: new Date().toISOString(),
     };
 
     client.publish({
-      destination: '/app/chat.send', // 서버측 @MessageMapping("/chat.send")
+      destination: '/app/chat.send',
       body: JSON.stringify(payload),
     });
+
+    // 입력값 초기화 + 포커스 복귀
     setInput('');
-  };
+    if (inputRef.current) {
+      inputRef.current.focus();
+    }
+  }, [input]);
 
-  // Enter 전송 (IME 조합 중 예외)
-  const handleKeyDown = (e) => {
-    if (e.isComposing) return;
-    if (e.key === 'Enter') sendMessage();
-  };
+  // 리스트 아이템 렌더 함수 (가상화 전용)
+  const itemContent = useCallback(
+    (index) => {
+      const m = messages[index];
+      const mine = isMine(m);
+      // 표시용 시간: 서버 createdAt 우선, 없으면 clientSentAt
+      const displayedAtIso = m?.createdAt ?? m?.clientSentAt;
+      const displayedAt = displayedAtIso ? new Date(displayedAtIso) : null;
+      const timeText = displayedAt ? timeFormatter.format(displayedAt) : null;
 
-  // 새 메시지 도착 시 자동 스크롤
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({behavior: 'smooth'});
-  }, [messages]);
+      return (
+        <Box
+          sx={{
+            px: 2,
+            py: 0.5,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: mine ? 'flex-end' : 'flex-start',
+          }}
+        >
+          {/* 상대방 메시지: 사용자 이름만(시간은 말풍선 하단 공통 처리) */}
+          {!mine && (
+            <Typography variant="caption" sx={{ color: 'text.secondary', mb: 0.3 }}>
+              {m?.sender ?? 'Unknown'}
+            </Typography>
+          )}
 
-  // 내 메시지 판정: userId 매칭 우선, 없으면 sender 매칭 보조
-  const isMine = (m) =>
-    (m?.userId && m.userId === myUserIdRef.current) ||
-    (m?.sender && m.sender === myNicknameRef.current);
+          {/* 말풍선 */}
+          <Box
+            sx={{
+              maxWidth: '70%',
+              bgcolor: mine ? 'primary.main' : 'grey.200',
+              color: mine ? 'white' : 'black',
+              px: 2,
+              py: 1,
+              borderRadius: 2,
+              boxShadow: 1,
+              wordBreak: 'break-word',
+              whiteSpace: 'pre-wrap',
+            }}
+          >
+            <Typography variant="body2">{m?.content ?? ''}</Typography>
+
+            {/* 모든 메시지: 말풍선 내부 우하단에 시간 표시(HH:mm:ss) */}
+            {timeText && (
+              <Typography
+                variant="caption"
+                sx={{ opacity: 0.85, display: 'block', textAlign: 'right', mt: 0.5 }}
+              >
+                {timeText}
+              </Typography>
+            )}
+          </Box>
+        </Box>
+      );
+    },
+    [messages, isMine, timeFormatter]
+  );
+
+  // Virtuoso는 itemContent가 바뀔 때만 영향. messages 길이만 의존.
+  const totalCount = messages.length;
 
   return (
     <Box
@@ -138,92 +282,44 @@ function App() {
           flexDirection: 'column',
         }}
       >
-        {/* 반응형 로고 헤더 */}
+        {/* 반응형 로고 헤더 (로고만 중앙) */}
         <Box
           sx={{
             p: 2,
             borderBottom: '1px solid #ddd',
             display: 'flex',
+            justifyContent: 'center',
             alignItems: 'center',
           }}
         >
-          <Box sx={{flex: 1, display: 'flex', justifyContent: 'center'}}>
-            <img
-              src="/android-chrome-192x192.png"
-              alt="Logo"
-              style={{height: logoHeight, width: 'auto', display: 'block'}}
-            />
-          </Box>
-        </Box>
-
-        {/* 메시지 리스트 영역 */}
-        <Box flex={1} overflow="auto" p={2}>
-          <List sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-            {messages.map((m, idx) => {
-              const mine = isMine(m);
-              return (
-                <Box
-                  key={idx}
-                  sx={{
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: mine ? 'flex-end' : 'flex-start',
-                  }}
-                >
-                  {/* 상대방 메시지: 사용자 이름 */}
-                  {!mine && (
-                    <Typography
-                      variant="caption"
-                      sx={{ color: 'text.secondary', mb: 0.3 }}
-                    >
-                      {m?.sender ?? 'Unknown'}
-                    </Typography>
-                  )}
-
-                  {/* 말풍선 */}
-                  <Box
-                    sx={{
-                      maxWidth: '70%',
-                      bgcolor: mine ? 'primary.main' : 'grey.200',
-                      color: mine ? 'white' : 'black',
-                      px: 2,
-                      py: 1,
-                      borderRadius: 2,
-                      boxShadow: 1,
-                      wordBreak: 'break-word',
-                    }}
-                  >
-                    <Typography variant="body2">
-                      {m?.content ?? ''}
-                    </Typography>
-                  </Box>
-                </Box>
-              );
-            })}
-            <div ref={messagesEndRef} />
-          </List>
-        </Box>
-
-
-        {/* 입력영역 */}
-        <Box display="flex" p={2} borderTop="1px solid #ddd" gap={1}>
-          <TextField
-            fullWidth
-            variant="outlined"
-            size="small"
-            placeholder="메시지를 입력하세요..."
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
+          <img
+            src="/android-chrome-192x192.png"
+            alt="Logo"
+            style={{ height: logoHeight, width: 'auto', display: 'block' }}
           />
-          <Button
-            variant="contained"
-            onClick={sendMessage}
-            disabled={!input.trim()}
-          >
-            전송
-          </Button>
         </Box>
+
+        {/* 메시지 리스트 (가상 스크롤) */}
+        <Box sx={{ flex: 1, borderBottom: '1px solid #eee', py: 2 }}>
+          <Virtuoso
+            data={messages}
+            totalCount={totalCount}
+            itemContent={itemContent}
+            // 바닥에 있을 때만 자동 스크롤 → 입력 지연 원인 제거
+            followOutput="auto"
+            // 성능: overscan 기본 적절, 필요 시 increaseViewportBy 조정
+            style={{ height: '100%' }}
+          />
+        </Box>
+
+        {/* 입력영역 (메모화) */}
+        <InputBar
+          value={input}
+          onChange={setInput}
+          onEnter={sendMessage}
+          onSend={sendMessage}
+          inputRef={inputRef}
+        />
       </Paper>
     </Box>
   );
