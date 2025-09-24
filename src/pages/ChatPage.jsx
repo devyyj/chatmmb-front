@@ -1,5 +1,4 @@
-// 헤더 우측에 상태 Chip 출력(연결됨/재연결 중/끊김)
-// 필요 시 Alert로 교체해도 무방
+// pages/ChatPage.jsx
 import React, { useMemo, useRef, useState, useCallback } from 'react';
 import { Box, Paper, Typography, Chip, Tooltip, useMediaQuery, useTheme } from '@mui/material';
 import InputBar from '../components/InputBar';
@@ -40,14 +39,26 @@ export default function ChatPage() {
   return (
     <Box display="flex" justifyContent="center" alignItems="center" minHeight="100vh" bgcolor="#f5f5f5" px={2}>
       <Paper elevation={3} sx={{ width: 'min(92vw, 520px)', height: 'min(86vh, 720px)', display: 'flex', flexDirection: 'column' }}>
-        {/* 헤더: 로고 중앙 + 접속자 수/상태 우측 */}
+        {/* 헤더: 좌측 접속자, 중앙 로고, 우측 상태 */}
         <Box sx={{ p: 2, borderBottom: '1px solid #ddd', display: 'flex', alignItems: 'center' }}>
-          <Box sx={{ flex: 1 }} />
-          <img src="/android-chrome-192x192.png" alt="Logo" style={{ height: logoHeight, width: 'auto', display: 'block' }} />
-          <Box sx={{ flex: 1, display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 1 }}>
+          {/* 좌측: 접속자 수 */}
+          <Box sx={{ flex: 1, display: 'flex', alignItems: 'center' }}>
             <Typography variant="caption" sx={{ color: 'text.secondary' }}>
               현재 접속자 {presenceCount}명
             </Typography>
+          </Box>
+
+          {/* 중앙: 로고 */}
+          <Box sx={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
+            <img
+              src="/android-chrome-192x192.png"
+              alt="Logo"
+              style={{ height: logoHeight, width: 'auto', display: 'block' }}
+            />
+          </Box>
+
+          {/* 우측: 연결 상태 */}
+          <Box sx={{ flex: 1, display: 'flex', justifyContent: 'flex-end', alignItems: 'center' }}>
             <Tooltip title={connReason || ''} arrow disableHoverListener={!connReason}>
               <Chip size="small" color={statusUi.color} label={statusUi.label} />
             </Tooltip>

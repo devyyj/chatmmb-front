@@ -1,13 +1,11 @@
 // hooks/useStompChat.js
-// 목적: 모바일에서 앱 전환(백그라운드) 후 브라우저로 복귀 시 STOMP 자동 재연결
-// 변경 사항 요약
-// - pageshow/visibilitychange/focus/online 이벤트에서 즉시 재연결 트리거
-// - onWebSocketClose 시 상태를 reconnecting으로 표기
-// - 송신 전에 연결 상태 보호(미연결 시 재연결 유도)
-// - presence 보정(REST) 즉시+200ms 2회 호출 유지
-// - heartbeat: incoming=10s, outgoing=0 (서버 설정과 합치)
-// - reconnectDelay=5000ms (필요 시 지수백오프로 확장 가능)
-
+// 목적: 모바일 백그라운드 복귀/네트워크 전환 시 안정적 재연결 + 상태 변경 시스템 메시지 출력
+// 개선점:
+// - 콜드스타트 억제(isColdStartRef, 800ms)
+// - 최초 연결 전에는 "백그라운드 복귀" 메시지 차단(everConnectedRef)
+// - 중복 트리거 쿨다운(lastReconnectAtRef, 500ms)
+// - 시스템 메시지 중복/정렬 안정화(seq, 최근 3초 dedup)
+// - StrictMode 유무와 무관하게 초기 새로고침 시 불필요한 시스템 메시지 방지
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { Client } from '@stomp/stompjs';
 import SockJS from 'sockjs-client/dist/sockjs.min.js';
@@ -34,7 +32,6 @@ function getPresenceKey() {
 /** 안전한 activate 헬퍼: 이미 활성화된 경우 중복 호출 방지 */
 function ensureActivate(client) {
   if (!client) return;
-  // @stomp/stompjs v7: active=true면 이미 activate() 호출된 상태
   if (!client.active) client.activate();
 }
 
@@ -43,11 +40,11 @@ export function useStompChat() {
   const [messages, setMessages] = useState([]);
   const [presenceCount, setPresenceCount] = useState(0);
   const [connStatus, setConnStatus] = useState('connecting');   // connecting | connected | reconnecting | disconnected
-  const [connReason, setConnReason] = useState('');             // 상태 툴팁에 표시
+  const [connReason, setConnReason] = useState('');
 
   // ====== 참조 ======
   const clientRef = useRef(null);
-  const myUserIdRef = useRef(genUUID()); // 탭 생애주기 기준 식별자
+  const myUserIdRef = useRef(genUUID());
   const myNicknameRef = useRef(() => {
     const suffix = myUserIdRef.current.split('-')[0].slice(-4);
     return `user-${suffix}`;
@@ -56,21 +53,58 @@ export function useStompChat() {
     myNicknameRef.current = myNicknameRef.current();
   }
   const presenceKeyRef = useRef(getPresenceKey());
-  const seenIdsRef = useRef(new Set()); // 중복 메시지 방지(id 기반)
+  const seenIdsRef = useRef(new Set());        // 서버 메시지 dedup
+  const sysSeqRef = useRef(0);                 // 시스템 메시지 정렬 보조
+  const isColdStartRef = useRef(true);         // 초기 800ms 억제
+  const everConnectedRef = useRef(false);      // 최초 연결 여부
+  const lastReconnectAtRef = useRef(0);        // 재연결 쿨다운
+  const connectingAnnouncedRef = useRef(false);// "연결 시도" 1회만
+  const recentSysMapRef = useRef(new Map());   // content 기반 3초 dedup
 
   // ====== 유틸 ======
-  /** createdAt > clientSentAt 순으로 정렬, 파싱 실패 안전 처리 */
+  /** createdAt > clientSentAt, 동률 시 seq로 안정 정렬 */
   const sortByTimestamp = useCallback((list) => {
     const toTs = (m) => {
       const v = Date.parse(m?.createdAt ?? m?.clientSentAt ?? 0);
       return Number.isFinite(v) ? v : 0;
     };
     const next = [...list];
-    next.sort((a, b) => toTs(a) - toTs(b));
+    next.sort((a, b) => {
+      const dt = toTs(a) - toTs(b);
+      if (dt !== 0) return dt;
+      const sa = Number.isFinite(a?.seq) ? a.seq : 0;
+      const sb = Number.isFinite(b?.seq) ? b.seq : 0;
+      return sa - sb;
+    });
     return next;
   }, []);
 
-  /** Presence 카운트 REST 보정 (즉시/200ms 딜레이 2회 호출에 사용) */
+  /** 시스템 메시지 푸시 (최근 3초 동일 문구 dedup) */
+  const pushSystemMessage = useCallback((text) => {
+    const now = Date.now();
+    // 3초 내 동일 문구면 스킵
+    const last = recentSysMapRef.current.get(text) || 0;
+    if (now - last < 3000) return;
+    recentSysMapRef.current.set(text, now);
+
+    const id = `system-${now}-${sysSeqRef.current}`;
+    const seq = sysSeqRef.current++;
+    setMessages((prev) =>
+      sortByTimestamp([
+        ...prev,
+        {
+          id,
+          seq,
+          sender: 'SYSTEM',
+          content: text,
+          createdAt: new Date().toISOString(),
+          system: true,
+        },
+      ])
+    );
+  }, [sortByTimestamp]);
+
+  /** Presence 카운트 REST 보정 */
   const syncPresence = useCallback(() => {
     const base = import.meta.env?.VITE_API_BASE || '';
     return fetch(`${base}/api/presence/count`, { method: 'GET', cache: 'no-store' })
@@ -81,38 +115,58 @@ export function useStompChat() {
       .catch(() => {});
   }, []);
 
-  /** 브라우저가 다시 보이거나(focus/pageshow) 온라인 복귀 시 재연결 */
+  /** 공통: 재연결 트리거(상태 가드+쿨다운+콜드스타트 억제) */
+  const triggerReconnect = useCallback((reasonText, withMessage = true) => {
+    const now = Date.now();
+
+    // 콜드스타트 800ms 억제
+    if (isColdStartRef.current) return;
+
+    // 이미 연결/연결 시도 중이면 스킵
+    if (connStatus === 'connecting' || connStatus === 'connected') return;
+
+    // 500ms 내 중복 트리거 억제
+    if (now - lastReconnectAtRef.current < 500) return;
+    lastReconnectAtRef.current = now;
+
+    setConnStatus('reconnecting');
+    setConnReason(reasonText);
+    if (withMessage && everConnectedRef.current) {
+      pushSystemMessage(reasonText);
+    }
+
+    ensureActivate(clientRef.current);
+    // presence 보정
+    syncPresence();
+    setTimeout(syncPresence, 200);
+  }, [connStatus, pushSystemMessage, syncPresence]);
+
+  /** 보임/포커스/온라인 등에서 재연결 */
   useEffect(() => {
+    // 콜드스타트 타이머 가동
+    const t = setTimeout(() => { isColdStartRef.current = false; }, 800);
+
     const onVisibleMaybeReconnect = () => {
+      // 페이지가 보이는 경우만
       if (document.visibilityState !== 'visible') return;
-
-      // Presence 값 보정 2회(즉시 + 200ms)
-      syncPresence();
-      setTimeout(syncPresence, 200);
-
-      const c = clientRef.current;
-      // 연결이 죽었거나 active=false 이면 즉시 재연결 시도
-      if (!c?.connected || !c?.active) {
-        setConnStatus('reconnecting');
-        setConnReason('resuming from background');
-        ensureActivate(c);
-      }
+      // 최초 연결 전이면 안내 메시지 생략 (실제 복귀 상황이 아님)
+      if (!everConnectedRef.current) return;
+      triggerReconnect('백그라운드에서 복귀하여 재연결 중입니다.');
     };
 
-    // iOS Safari: bfcache 복귀 케이스
-    const onPageShow = (e) => {
-      if (e.persisted) onVisibleMaybeReconnect();
-      else onVisibleMaybeReconnect();
+    const onPageShow = () => {
+      // bfcache 포함. 최초 연결 전이면 메시지 생략
+      if (!everConnectedRef.current) return;
+      triggerReconnect('페이지 복귀로 재연결 중입니다.');
     };
 
-    const onFocus = () => onVisibleMaybeReconnect();
+    const onFocus = () => {
+      if (!everConnectedRef.current) return;
+      triggerReconnect('포커스 복귀로 재연결 중입니다.', false); // 메시지 중복 줄이기
+    };
+
     const onOnline = () => {
-      setConnStatus('reconnecting');
-      setConnReason('network online');
-      ensureActivate(clientRef.current);
-      // 온라인 전환 시에도 존재 카운트 보정
-      syncPresence();
-      setTimeout(syncPresence, 200);
+      triggerReconnect('네트워크가 온라인으로 전환되어 재연결 중입니다.');
     };
 
     document.addEventListener('visibilitychange', onVisibleMaybeReconnect);
@@ -121,12 +175,13 @@ export function useStompChat() {
     window.addEventListener('online', onOnline);
 
     return () => {
+      clearTimeout(t);
       document.removeEventListener('visibilitychange', onVisibleMaybeReconnect);
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('pageshow', onPageShow);
       window.removeEventListener('online', onOnline);
     };
-  }, [syncPresence]);
+  }, [triggerReconnect]);
 
   // ====== STOMP 클라이언트 수명주기 ======
   useEffect(() => {
@@ -135,21 +190,27 @@ export function useStompChat() {
 
     setConnStatus('connecting');
     setConnReason('');
+    if (!connectingAnnouncedRef.current) {
+      connectingAnnouncedRef.current = true;
+      pushSystemMessage('서버에 연결을 시도합니다.');
+    }
 
     const client = new Client({
       webSocketFactory: () => new SockJS(wsUrl),
-      reconnectDelay: 5000,           // 고정 5s (필요 시 지수백오프+지터 가능)
-      heartbeatIncoming: 10000,       // 서버 → 클라이언트 (서버 설정과 일치)
-      heartbeatOutgoing: 0,           // 클라 → 서버 비활성(백그라운드 종료 완화)
+      reconnectDelay: 5000,
+      heartbeatIncoming: 10000,
+      heartbeatOutgoing: 0,
       connectHeaders: {
-        'presence-key': presenceKeyRef.current, // 서버의 presence grace 취소용 헤더
+        'presence-key': presenceKeyRef.current,
       },
       // debug: console.log,
       onConnect: () => {
         setConnStatus('connected');
         setConnReason('');
+        everConnectedRef.current = true;
+        pushSystemMessage('서버와 연결되었습니다.');
 
-        // /topic/presence 구독: 카운트 갱신
+        // /topic/presence 구독
         client.subscribe('/topic/presence', (msg) => {
           try {
             const body = JSON.parse(msg.body);
@@ -157,11 +218,10 @@ export function useStompChat() {
           } catch {}
         });
 
-        // /topic/public 구독: 메시지 수신
+        // /topic/public 구독
         client.subscribe('/topic/public', (msg) => {
           try {
             const body = JSON.parse(msg.body);
-            // id 기반 dedup (서버가 동일 메시지 재전달/재연결 시)
             const id = body?.id;
             if (id && seenIdsRef.current.has(id)) return;
             if (id) seenIdsRef.current.add(id);
@@ -169,45 +229,59 @@ export function useStompChat() {
           } catch {}
         });
 
-        // 구독 직후 REST 보정 2회
+        // REST 보정
         syncPresence();
         setTimeout(syncPresence, 200);
       },
       onStompError: (frame) => {
         setConnStatus('reconnecting');
-        setConnReason(frame?.headers?.message || 'broker error');
+        const msg = frame?.headers?.message || 'broker error';
+        setConnReason(msg);
+        if (everConnectedRef.current) {
+          pushSystemMessage(`브로커 오류로 재연결 중입니다.${frame?.headers?.message ? ` (${frame.headers.message})` : ''}`);
+        }
       },
       onWebSocketError: () => {
         setConnStatus('reconnecting');
         setConnReason('websocket error');
+        if (everConnectedRef.current) {
+          pushSystemMessage('웹소켓 오류로 재연결 중입니다.');
+        }
       },
       onWebSocketClose: (ev) => {
-        // 모바일 백그라운드 전환 시 주로 발생
         setConnStatus('reconnecting');
         setConnReason(`socket closed${ev?.code ? ` (code ${ev.code})` : ''}`);
+        if (everConnectedRef.current) {
+          pushSystemMessage(`연결이 종료되어 재연결 중입니다.${ev?.code ? ` (code ${ev.code})` : ''}`);
+        }
         // reconnectDelay에 따라 자동 재시도
       },
     });
 
     clientRef.current = client;
-    ensureActivate(client); // 최초 연결 시도
+    ensureActivate(client);
 
     return () => {
+      // 언마운트 시 메시지 출력하지 않음(새로고침/라우트 전환에서 혼선 방지)
       client.deactivate();
       clientRef.current = null;
       setConnStatus('disconnected');
+      setConnReason('component unmounted');
     };
-  }, [sortByTimestamp, syncPresence]);
+  }, [sortByTimestamp, syncPresence, pushSystemMessage]);
 
   // ====== 송신 API ======
   const send = useCallback((text) => {
     const client = clientRef.current;
-    // 연결이 없으면 사용자를 기다리게 하지 말고 즉시 재연결 시도
     if (!client || !client.connected) {
       setConnStatus('reconnecting');
       setConnReason('send requested while disconnected');
+      // 최초 연결 전이면 시스템 메시지 생략
+      if (everConnectedRef.current) {
+        pushSystemMessage('연결이 없어 메시지를 전송할 수 없습니다. 재연결 중입니다.');
+      }
       ensureActivate(client);
-      return; // 낙관적 UI가 없다면 보류
+      return;
     }
     const payload = {
       userId: myUserIdRef.current,
@@ -216,7 +290,7 @@ export function useStompChat() {
       clientSentAt: new Date().toISOString(),
     };
     client.publish({ destination: '/app/chat.send', body: JSON.stringify(payload) });
-  }, []);
+  }, [pushSystemMessage]);
 
   // ====== 나의 메타 ======
   const my = useMemo(

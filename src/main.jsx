@@ -36,12 +36,12 @@ const theme = createTheme({
 });
 
 createRoot(document.getElementById('root')).render(
-  <StrictMode>
+  // <StrictMode>
     <ThemeProvider theme={theme}>
       <CssBaseline/>
       <App/>
     </ThemeProvider>
-  </StrictMode>,
+  // </StrictMode>,
 )
 
 // 자동 배포 테스트
