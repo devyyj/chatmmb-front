@@ -1,8 +1,8 @@
-// src/hooks/useStompChat.js
-// 목적: 새로고침 시 실제 접속자 수와 일치하도록
-// - /topic/presence 구독 직후 REST 재동기화(syncPresence) 2회 호출(즉시 + 200ms 보정)
-// - 연결 상태(connected/connecting/reconnecting/disconnected) 노출 유지
-// - 메시지 정렬(createdAt > clientSentAt) 유지
+// 핵심 변경점:
+// - connectHeaders에 persistent presenceKey 전송(localStorage 기반)
+// - heartbeatOutgoing=0, heartbeatIncoming=10000 (서버는 클라 하트비트 기대 안 함)
+// - visibilitychange: 포그라운드 복귀 즉시 재동기화/재연결 보정
+// - onConnect 후 presence 구독 -> REST 재동기화(2회) 유지
 
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { Client } from '@stomp/stompjs';
@@ -13,16 +13,28 @@ function genUUID() {
     || `uid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// 지속 키: 브라우저(설치된 앱 아님) 단위로 유지
+function getPresenceKey() {
+  try {
+    const k = localStorage.getItem('presenceKey');
+    if (k) return k;
+    const nk = genUUID();
+    localStorage.setItem('presenceKey', nk);
+    return nk;
+  } catch {
+    // 프라이버시 모드 등 localStorage 불가 시 메모리 폴백
+    return genUUID();
+  }
+}
+
 export function useStompChat() {
-  // 메시지 / 접속자 수 / 연결 상태
   const [messages, setMessages] = useState([]);
   const [presenceCount, setPresenceCount] = useState(0);
   const [connStatus, setConnStatus] = useState('connecting');
   const [connReason, setConnReason] = useState('');
 
-  // STOMP 클라이언트 및 탭 생애주기(LTT) 식별자
   const clientRef = useRef(null);
-  const myUserIdRef = useRef(genUUID());
+  const myUserIdRef = useRef(genUUID()); // 탭 생애주기용
   const myNicknameRef = useRef(() => {
     const suffix = myUserIdRef.current.split('-')[0].slice(-4);
     return `user-${suffix}`;
@@ -31,7 +43,8 @@ export function useStompChat() {
     myNicknameRef.current = myNicknameRef.current();
   }
 
-  // 메시지 정렬: 서버 createdAt 우선, 없으면 clientSentAt
+  const presenceKeyRef = useRef(getPresenceKey());
+
   const sortByTimestamp = useCallback((list) => {
     const next = [...list];
     next.sort((a, b) => {
@@ -42,7 +55,6 @@ export function useStompChat() {
     return next;
   }, []);
 
-  // 구독 직후 현재 presence를 REST로 동기화(놓친 브로드캐스트 보정)
   const syncPresence = useCallback(() => {
     const base = import.meta.env?.VITE_API_BASE || '';
     return fetch(`${base}/api/presence/count`, { method: 'GET', cache: 'no-store' })
@@ -50,12 +62,27 @@ export function useStompChat() {
       .then((data) => {
         if (typeof data?.count === 'number') setPresenceCount(data.count);
       })
-      .catch(() => {
-        // 네트워크/CORS 실패는 무시(브로드캐스트로 자연 보정)
-      });
+      .catch(() => {});
   }, []);
 
-  // STOMP 연결/구독
+  // 가시성 전환: 포그라운드 복귀 시 즉시 보정
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === 'visible') {
+        // 소켓이 죽었으면 재시도, 살아있어도 값 보정
+        syncPresence();
+        setTimeout(syncPresence, 200);
+        const c = clientRef.current;
+        if (c && !c.connected && c.active) {
+          // @stomp/stompjs는 활성 상태면 자동 재시도 중. 필요 시 강제 재시도 트리거:
+          try { c.deactivate().then(() => c.activate()); } catch {}
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [syncPresence]);
+
   useEffect(() => {
     const base = import.meta.env?.VITE_API_BASE || '';
     const wsUrl = `${base}/ws-sockjs`;
@@ -66,7 +93,14 @@ export function useStompChat() {
     const socket = new SockJS(wsUrl);
     const client = new Client({
       webSocketFactory: () => socket,
-      reconnectDelay: 5000, // 자동 재연결
+      reconnectDelay: 5000,
+      // 서버가 클라이언트 하트비트를 기대하지 않게 함 → 백그라운드 종료 완화
+      heartbeatIncoming: 10000, // 서버 → 클라
+      heartbeatOutgoing: 0,     // 클라 → 서버 (0으로 협상)
+      connectHeaders: {
+        // 서버 ChannelInterceptor에서 읽어 프레즌스 그레이스에 사용
+        'presence-key': presenceKeyRef.current,
+      },
       // debug: console.log,
     });
 
@@ -74,24 +108,18 @@ export function useStompChat() {
       setConnStatus('connected');
       setConnReason('');
 
-      // 1) presence 먼저 구독
       client.subscribe('/topic/presence', (msg) => {
         try {
           const body = JSON.parse(msg.body);
           if (typeof body?.count === 'number') setPresenceCount(body.count);
-        } catch {
-          // ignore
-        }
+        } catch {}
       });
 
-      // 2) 메시지 채널 구독
       client.subscribe('/topic/public', (msg) => {
         try {
           const body = JSON.parse(msg.body);
           setMessages((prev) => sortByTimestamp([...prev, body]));
-        } catch {
-          // ignore
-        }
+        } catch {}
       });
 
       // 선택: 입장 알림
@@ -104,16 +132,13 @@ export function useStompChat() {
             content: '',
           }),
         });
-      } catch {
-        // endpoint 미구현 시 무시
-      }
+      } catch {}
 
-      // 3) 구독 직후 REST로 현재값 재동기화(놓친 브로드캐스트 보정)
+      // 구독 직후 현재값 보정
       syncPresence();
-      setTimeout(syncPresence, 200); // 브로커 이벤트 지연 레이스 보정
+      setTimeout(syncPresence, 200);
     };
 
-    // 오류/닫힘 → 재연결 상태 전환
     client.onStompError = (frame) => {
       setConnStatus('reconnecting');
       setConnReason(frame?.headers?.message || 'broker error');
@@ -137,22 +162,16 @@ export function useStompChat() {
     };
   }, [sortByTimestamp, syncPresence]);
 
-  // 발신
   const send = useCallback((text) => {
     const client = clientRef.current;
     if (!client || !client.connected) return;
-
     const payload = {
       userId: myUserIdRef.current,
       sender: myNicknameRef.current,
       content: text,
       clientSentAt: new Date().toISOString(),
     };
-
-    client.publish({
-      destination: '/app/chat.send',
-      body: JSON.stringify(payload),
-    });
+    client.publish({ destination: '/app/chat.send', body: JSON.stringify(payload) });
   }, []);
 
   const my = useMemo(
